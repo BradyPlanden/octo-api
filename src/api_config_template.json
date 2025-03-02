@@ -1,0 +1,6 @@
+{
+    "base_url": "https://api.octopus.energy/v1/electricity-meter-points",
+    "api_key": "",
+    "mpan": "",
+    "serial": ""
+}
