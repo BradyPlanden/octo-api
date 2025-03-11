@@ -14,6 +14,10 @@ cargo install --git https://github.com/BradyPlanden/octo-data.git
 
 To use the module, create a`api_config.json` file from the template and store it in the same directory as the executable or the `cargo run` command.
 
+```bash
+cargo run octo-api
+```
+
 Data will be retrieved via the REST API and stored in parquet format named `data.parquet`. The format of this file will be:
 
 | consumption   | interval end | interval begin |
