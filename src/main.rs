@@ -1,101 +1,137 @@
 use base64::{engine::general_purpose, Engine as _};
-use std::fs::File;
-use std::num::NonZero;
-use serde_json;
-use tokio;
 use polars::prelude::*;
+use std::fs::File;
+use std::num::NonZeroUsize;
+use std::path::Path;
 
 struct ApiConfig {
     base_url: String,
     api_key: String,
     mpan: String,
     serial: String,
+    page_size: usize,
+    period_from: String,
+    period_to: String,
     url: Option<String>,
 }
 
 impl ApiConfig {
-    fn new(base_url: &str, api_key: &str, mpan: &str, serial: &str) -> Self{
-        ApiConfig {
+    fn new(
+        base_url: &str,
+        api_key: &str,
+        mpan: &str,
+        serial: &str,
+        page_size: usize,
+        period_from: &str,
+        period_to: &str,
+    ) -> Self {
+        Self {
             base_url: base_url.to_string(),
             api_key: api_key.to_string(),
             mpan: mpan.to_string(),
             serial: serial.to_string(),
+            page_size,
+            period_from: period_from.to_string(),
+            period_to: period_to.to_string(),
             url: None,
         }
     }
     fn url(&self) -> String {
         // Return cached value if it exists, otherwise calculate
         self.url.clone().unwrap_or_else(|| {
-            format!("{}/{}/meters/{}/consumption/?page_size={}&period_from={}&period_to={}",
-                    self.base_url, self.mpan, self.serial, 500*48, "2024-01-10T00:00Z", "2025-03-09T00:00Z")
+            format!(
+                "{}/{}/meters/{}/consumption/?page_size={}&period_from={}&period_to={}",
+                self.base_url,
+                self.mpan,
+                self.serial,
+                self.page_size,
+                self.period_from,
+                self.period_to
+            )
         })
     }
 }
 
-/// For a given api configuration, request the data and convert to json object
-async fn get_api_data(api_config: ApiConfig)-> Result<serde_json::Value, reqwest::Error>{
-    let response = reqwest::Client::new()
-        .get(api_config.url())
-        .header("Authorization", format!("Basic {}", general_purpose::STANDARD.encode(api_config.api_key)))
+/// Fetches API data and stores it as a JSON object
+async fn get_api_data(config: &ApiConfig) -> Result<serde_json::Value, reqwest::Error> {
+    let client = reqwest::Client::new();
+    let auth_header = format!(
+        "Basic {}",
+        general_purpose::STANDARD.encode(&config.api_key)
+    );
+
+    let response = client
+        .get(config.url())
+        .header("Authorization", auth_header)
         .send()
         .await?;
 
-    if response.status().is_success() {
-        let json: serde_json::Value = response.json().await?;
-        Ok(json)
-    } else {
-        Err(response.error_for_status().unwrap_err())
-    }
+    response.error_for_status()?.json().await
 }
 
-/// Construct a polars dataframe from a serde json object
-fn construct_dataframe(json: &serde_json::value::Value, field: &str)-> DataFrame {
-    let json_str = serde_json::to_string(&json[field])
-        .expect("Failed to serialize JSON value");
+/// Construct a Polars dataframe from a serde JSON object
+fn construct_dataframe(
+    json: &serde_json::value::Value,
+    field: &str,
+) -> Result<DataFrame, PolarsError> {
+    let json_str = serde_json::to_string(&json[field]).expect("Failed to serialize JSON value");
 
-    let df = polars::prelude::JsonReader::new(
-        std::io::Cursor::new(json_str.as_bytes())
-    )
-    .infer_schema_len(Some(NonZero::new(100).unwrap()))  // Optional: limit rows for schema inference
-    .finish()
-    .expect("Failed to parse JSON");
-    df
+    let df = JsonReader::new(std::io::Cursor::new(json_str.as_bytes()))
+        .infer_schema_len(Some(NonZeroUsize::new(100).unwrap())) // Optional: limit rows for schema inference
+        .finish()
+        .expect("Failed to parse JSON");
+
+    Ok(df)
 }
 
 /// Writes a dataframe to a provided parquet file
-fn write_parquet(df: &mut DataFrame, file: File) {
-    let parquet_writer = ParquetWriter::new(file)
-        .with_compression(ParquetCompression::Snappy);
+fn write_parquet(df: &mut DataFrame, path: impl AsRef<Path>) -> Result<(), PolarsError> {
+    let file = File::create(path)?;
 
-    // write
-    parquet_writer.finish(df)
-        .expect("Failed to write parquet file");
+    ParquetWriter::new(file)
+        .with_compression(ParquetCompression::Snappy)
+        .finish(df)?;
+
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), PolarsError>  {
+async fn main() -> Result<(), PolarsError> {
     // API configuration
-    let file = File::open("src/api_config.json")
-        .expect("file should open read only");
-    let json: serde_json::Value = serde_json::from_reader(file)
-        .expect("file should be proper JSON");
+    let file = File::open("src/api_config.json").expect("failed to open config file");
+    let json: serde_json::Value =
+        serde_json::from_reader(file).expect("failed to parse config as JSON");
 
-    // Construct api
+    // Construct api config
     let api_config = ApiConfig::new(
-        json["base_url"].as_str().expect("base_url should be a string"),
-        json["api_key"].as_str().expect("api_key should be a string"),
-        json["mpan"].as_str().expect("mpan should be a string"),
-        json["serial"].as_str().expect("serial should be a string"),
+        json["base_url"]
+            .as_str()
+            .expect("base_url not a string or missing"),
+        json["api_key"]
+            .as_str()
+            .expect("api_key not a string or missing"),
+        json["mpan"].as_str().expect("mpan not a string or missing"),
+        json["serial"]
+            .as_str()
+            .expect("serial not a string or missing"),
+        json["page_size"]
+            .as_i64()
+            .expect("page number not a number or missing") as usize,
+        json["period_from"]
+            .as_str()
+            .expect("period_from not a string or missing"),
+        json["period_to"]
+            .as_str()
+            .expect("period_to not a string or missing"),
     );
 
-    // Get API data
-    let agile_data = get_api_data(api_config).await.unwrap();
-    let mut df = construct_dataframe(&agile_data, "results");
+    // Get API data and write parquet
+    let path = "data.parquet";
+    let agile_data = get_api_data(&api_config).await.unwrap();
+    let mut df = construct_dataframe(&agile_data, "results")?;
+    write_parquet(&mut df, path)?;
 
-    // Write parquet file
-    let file = File::create("data.parquet").expect("Could not create file");
-    write_parquet(&mut df, file);
-
+    println!("Data successfully written to {}", path);
     Ok(())
 
     // Test write
@@ -105,7 +141,6 @@ async fn main() -> Result<(), PolarsError>  {
 
     // let stored_data = import_stored_parquet(path);
     // let indices = compare_stored_with_api(api_data, stored_data);
-
 }
 
 // To Do:

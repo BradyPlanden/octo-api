@@ -2,5 +2,8 @@
     "base_url": "https://api.octopus.energy/v1/electricity-meter-points",
     "api_key": "",
     "mpan": "",
-    "serial": ""
+    "serial": "",
+    "page_size": 10,
+    "period_from": "2025-01-01T00:00Z",
+    "period_to": "2025-03-00T00:00Z"
 }
